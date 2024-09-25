@@ -1,16 +1,14 @@
 package main
 
 import (
-	"bytes"
 	"crypto/ed25519"
-	"crypto/sha512"
 	"encoding/base32"
 	"fmt"
+	"math/rand"
 	"os"
 	"regexp"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,43 +21,42 @@ var (
 	generated int64 // Number of generated addresses
 )
 
-const batchSize = 10000 // Increased batch size for better performance
+const batchSize = 100000 // Increased batch size for better performance
 
-// Preallocate buffers for each goroutine
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		buffer := new(bytes.Buffer)
-		buffer.Grow(100)
-		return buffer
-	},
-}
+var base32Lower = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
 
 // generateBatch generates a batch of keys and checks them against the regular expressions
-func generateBatch(wg *sync.WaitGroup, regexps []*regexp.Regexp, resultChan chan<- string, saveWg *sync.WaitGroup) {
-	buffer := bufferPool.Get().(*bytes.Buffer)
-	defer bufferPool.Put(buffer)
+func generateBatch(wg *sync.WaitGroup, regexps []*regexp.Regexp, resultChan chan<- string) {
+	// Initialize fast random generator
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	batch := make([]ed25519.PublicKey, batchSize)
-	batchSecretKeys := make([]ed25519.PrivateKey, batchSize)
+	// Preallocate buffers
+	seeds := make([]byte, batchSize*ed25519.SeedSize)
+	publicKeys := make([][32]byte, batchSize)
+	privateKeys := make([][64]byte, batchSize)
+	var tmp [48]byte
+	var addressBytes [35]byte
 
 	for {
-		// Generate a batch of keys
+		// Generate random seeds
+		rnd.Read(seeds)
+
+		// Generate keys
 		for i := 0; i < batchSize; i++ {
-			pub, priv, _ := ed25519.GenerateKey(nil)
-			batch[i] = pub
-			batchSecretKeys[i] = priv
+			seed := seeds[i*ed25519.SeedSize : (i+1)*ed25519.SeedSize]
+			privateKey := ed25519.NewKeyFromSeed(seed)
+			copy(privateKeys[i][:], privateKey)
+			copy(publicKeys[i][:], privateKey[32:])
 		}
-		atomic.AddInt64(&generated, batchSize)
+		atomic.AddInt64(&generated, int64(batchSize))
 
 		// Check generated keys
-		for i, publicKey := range batch {
-			buffer.Reset()
-			onionAddress := encodePublicKey(publicKey, buffer)
+		for i := 0; i < batchSize; i++ {
+			onionAddress := encodePublicKey(publicKeys[i][:], &tmp, &addressBytes)
 			for _, re := range regexps {
 				if re.MatchString(onionAddress) {
 					resultChan <- onionAddress
-					saveWg.Add(1)
-					go save(onionAddress, publicKey, expandSecretKey(batchSecretKeys[i]), saveWg)
+					save(onionAddress, publicKeys[i][:], expandSecretKey(privateKeys[i][:]))
 					atomic.AddInt64(&found, 1)
 					wg.Done()
 					break
@@ -70,8 +67,10 @@ func generateBatch(wg *sync.WaitGroup, regexps []*regexp.Regexp, resultChan chan
 }
 
 // expandSecretKey expands the secret key to 64 bytes
-func expandSecretKey(secretKey ed25519.PrivateKey) [64]byte {
-	hash := sha512.Sum512(secretKey[:32])
+func expandSecretKey(secretKey []byte) [64]byte {
+	var hashInput [32]byte
+	copy(hashInput[:], secretKey[:32])
+	hash := sha3.Sum512(hashInput[:])
 	hash[0] &= 248
 	hash[31] &= 127
 	hash[31] |= 64
@@ -79,21 +78,21 @@ func expandSecretKey(secretKey ed25519.PrivateKey) [64]byte {
 }
 
 // encodePublicKey encodes the public key into an onion address
-func encodePublicKey(publicKey ed25519.PublicKey, buffer *bytes.Buffer) string {
-	buffer.Write([]byte(".onion checksum"))
-	buffer.Write(publicKey)
-	buffer.WriteByte(0x03)
-	checksum := sha3.Sum256(buffer.Bytes())
-	buffer.Reset()
-	buffer.Write(publicKey)
-	buffer.Write(checksum[:2])
-	buffer.WriteByte(0x03)
-	return strings.ToLower(base32.StdEncoding.EncodeToString(buffer.Bytes()))
+func encodePublicKey(publicKey []byte, tmp *[48]byte, addressBytes *[35]byte) string {
+	copy(tmp[0:], ".onion checksum")
+	copy(tmp[15:], publicKey)
+	tmp[47] = 0x03
+	checksum := sha3.Sum256(tmp[:])
+
+	copy(addressBytes[0:], publicKey)
+	copy(addressBytes[32:], checksum[:2])
+	addressBytes[34] = 0x03
+
+	return base32Lower.EncodeToString(addressBytes[:])
 }
 
 // save stores the generated keys and address in files
-func save(onionAddress string, publicKey ed25519.PublicKey, secretKey [64]byte, wg *sync.WaitGroup) {
-	defer wg.Done()
+func save(onionAddress string, publicKey []byte, secretKey [64]byte) {
 	err := os.MkdirAll(onionAddress, 0700)
 	if err != nil {
 		fmt.Printf("Error creating directory %s: %v\n", onionAddress, err)
@@ -164,7 +163,6 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-	var saveWg sync.WaitGroup
 	if numAddresses < 1 {
 		numAddresses = 1
 	}
@@ -177,7 +175,7 @@ func main() {
 	// Start goroutines for address generation
 	numCPU := runtime.NumCPU()
 	for i := 0; i < numCPU; i++ {
-		go generateBatch(&wg, regexps, resultChan, &saveWg)
+		go generateBatch(&wg, regexps, resultChan)
 	}
 
 	// Goroutine to print found addresses
@@ -189,7 +187,4 @@ func main() {
 
 	wg.Wait()
 	close(resultChan)
-
-	// Wait for all save operations to complete
-	saveWg.Wait()
 }
