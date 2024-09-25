@@ -23,12 +23,22 @@ var (
 	generated int64 // Number of generated addresses
 )
 
-const batchSize = 1000 // Batch size for key generation
+const batchSize = 10000 // Increased batch size for better performance
+
+// Preallocate buffers for each goroutine
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		buffer := new(bytes.Buffer)
+		buffer.Grow(100)
+		return buffer
+	},
+}
 
 // generateBatch generates a batch of keys and checks them against the regular expressions
 func generateBatch(wg *sync.WaitGroup, regexps []*regexp.Regexp, resultChan chan<- string, saveWg *sync.WaitGroup) {
-	var buffer bytes.Buffer
-	buffer.Grow(100) // Pre-allocate memory for the buffer
+	buffer := bufferPool.Get().(*bytes.Buffer)
+	defer bufferPool.Put(buffer)
+
 	batch := make([]ed25519.PublicKey, batchSize)
 	batchSecretKeys := make([]ed25519.PrivateKey, batchSize)
 
@@ -44,12 +54,12 @@ func generateBatch(wg *sync.WaitGroup, regexps []*regexp.Regexp, resultChan chan
 		// Check generated keys
 		for i, publicKey := range batch {
 			buffer.Reset()
-			onionAddress := encodePublicKey(publicKey, &buffer)
+			onionAddress := encodePublicKey(publicKey, buffer)
 			for _, re := range regexps {
 				if re.MatchString(onionAddress) {
 					resultChan <- onionAddress
 					saveWg.Add(1)
-					go save(onionAddress, publicKey, expandSecretKey(batchSecretKeys[i]), saveWg) // Asynchronous saving
+					go save(onionAddress, publicKey, expandSecretKey(batchSecretKeys[i]), saveWg)
 					atomic.AddInt64(&found, 1)
 					wg.Done()
 					break
@@ -165,7 +175,8 @@ func main() {
 	go printStats(time.Now())
 
 	// Start goroutines for address generation
-	for i := 0; i < runtime.NumCPU(); i++ {
+	numCPU := runtime.NumCPU()
+	for i := 0; i < numCPU; i++ {
 		go generateBatch(&wg, regexps, resultChan, &saveWg)
 	}
 
